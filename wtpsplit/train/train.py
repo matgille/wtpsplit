@@ -23,7 +23,26 @@ from tokenizers import AddedToken
 from torchinfo import summary
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, HfArgumentParser, TrainingArguments, set_seed
-from transformers.trainer import is_torch_tpu_available
+
+try:
+    from transformers.utils import is_torch_tpu_available as _hf_is_torch_tpu_available
+except Exception:
+    _hf_is_torch_tpu_available = None
+try:
+    from transformers.utils import is_torch_xla_available as _hf_is_torch_xla_available
+except Exception:
+    _hf_is_torch_xla_available = None
+
+def is_torch_tpu_available(check_device: bool = False) -> bool:
+    if _hf_is_torch_tpu_available is not None:
+        try:
+            return _hf_is_torch_tpu_available(check_device=check_device)
+        except TypeError:
+            return _hf_is_torch_tpu_available()
+    if _hf_is_torch_xla_available is not None:
+        return _hf_is_torch_xla_available()
+    return False
+# ---------------------------------------------------------
 
 import wandb
 from wtpsplit.models import (

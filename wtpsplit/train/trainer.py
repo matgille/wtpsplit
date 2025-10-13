@@ -1,37 +1,120 @@
-import os
-from typing import Dict
+# --- imports pour wtpsplit/train/trainer.py ---
 
+import logging
 import numpy as np
-import torch
-import transformers
-from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
-from transformers import PreTrainedModel
-from transformers.trainer import (
-    ALL_LAYERNORM_LAYERS,
-    TRAINING_ARGS_NAME,
-    WEIGHTS_NAME,
-    DataLoader,
-    EvalLoopOutput,
-    IterableDatasetShard,
-    List,
-    Optional,
-    ShardedDDPOption,
-    deepspeed_init,
-    denumpify_detensorize,
-    find_batch_size,
-    get_parameter_names,
-    has_length,
-    is_sagemaker_mp_enabled,
-    is_torch_tpu_available,
-    logger,
-    nested_concat,
-    nested_numpify,
-    nested_truncate,
-)
-from transformers.modeling_utils import unwrap_model
+
+try:
+    from transformers.trainer_utils import ShardedDDPOption as _HF_ShardedDDPOption
+except Exception:
+    try:
+        from transformers.trainer import ShardedDDPOption as _HF_ShardedDDPOption
+    except Exception:
+        _HF_ShardedDDPOption = None
+
+def _is_sharded_ddp_simple(val) -> bool:
+    # Si l'enum existe, on compare proprement
+    if _HF_ShardedDDPOption is not None:
+        try:
+            return val == _HF_ShardedDDPOption.SIMPLE
+        except Exception:
+            pass
+    # Sinon, fallback robuste par string
+    return str(val).lower() == "simple"
 
 from wtpsplit.train.utils import Model
+
+from typing import List, Optional, Callable, Tuple, Union
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+from transformers import Trainer as HFTrainer, TrainingArguments, PreTrainedModel, __version__
+from transformers.modeling_utils import unwrap_model
+
+# Utilitaires du Trainer (emplacements stables en 4.39.x)
+from transformers.trainer_utils import (
+    EvalLoopOutput,
+    EvalPrediction,
+    has_length,
+    denumpify_detensorize,
+)
+
+# Shim SageMaker MP (absent sur certaines versions)
+try:
+    from transformers.trainer_utils import is_sagemaker_mp_enabled as _hf_is_sagemaker_mp_enabled
+except Exception:
+    def is_sagemaker_mp_enabled() -> bool:
+        return False
+else:
+    is_sagemaker_mp_enabled = _hf_is_sagemaker_mp_enabled
+
+from transformers.trainer_pt_utils import (
+    IterableDatasetShard,
+    find_batch_size,
+    nested_concat,
+    nested_numpify,
+)
+# nested_truncate n’existe pas toujours -> fallback
+try:
+    from transformers.trainer_pt_utils import nested_truncate
+except Exception:
+    def nested_truncate(tensors, limit):
+        if isinstance(tensors, (list, tuple)):
+            return type(tensors)(nested_truncate(t, limit) for t in tensors)
+        if hasattr(tensors, "__len__"):
+            return tensors[:limit]
+        return tensors
+
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+
+# get_parameter_names a changé d’emplacement selon les versions
+try:
+    from transformers.trainer import get_parameter_names
+except Exception:
+    from transformers.trainer_utils import get_parameter_names
+
+# DeepSpeed: point d’entrée variable
+try:
+    from transformers.deepspeed import deepspeed_init
+except Exception:
+    from transformers.integrations.deepspeed import deepspeed_init  # type: ignore
+
+from transformers.utils import (
+    CONFIG_NAME,
+    logging,
+    is_accelerate_available,
+    is_apex_available,
+)
+
+# WEIGHTS_NAME a aussi bougé selon les versions
+try:
+    from transformers.utils import WEIGHTS_NAME
+except Exception:
+    from transformers.utils.constants import WEIGHTS_NAME
+
+# ---- TPU/XLA compat: wrapper qui accepte check_device ----
+try:
+    from transformers.utils import is_torch_tpu_available as _hf_is_torch_tpu_available
+except Exception:
+    _hf_is_torch_tpu_available = None
+try:
+    from transformers.utils import is_torch_xla_available as _hf_is_torch_xla_available
+except Exception:
+    _hf_is_torch_xla_available = None
+
+def is_torch_tpu_available(check_device: bool = False) -> bool:
+    if _hf_is_torch_tpu_available is not None:
+        try:
+            return _hf_is_torch_tpu_available(check_device=check_device)
+        except TypeError:
+            return _hf_is_torch_tpu_available()
+    if _hf_is_torch_xla_available is not None:
+        return _hf_is_torch_xla_available()
+    return False
+# -----------------------------------------------------------------
+
 
 if is_torch_tpu_available(check_device=False):
     import torch_xla.core.xla_model as xm  # noqa: F401
@@ -39,7 +122,7 @@ if is_torch_tpu_available(check_device=False):
     import torch_xla.distributed.parallel_loader as pl  # noqa: F401
 
 
-class Trainer(transformers.Trainer):
+class Trainer(HFTrainer):
     def get_param_groups(self):
         opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
 
@@ -108,7 +191,7 @@ class Trainer(transformers.Trainer):
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
-            if self.sharded_ddp == ShardedDDPOption.SIMPLE:
+            if _is_sharded_ddp_simple(getattr(self, "sharded_ddp", None)):
                 raise NotImplementedError()
             else:
                 self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
