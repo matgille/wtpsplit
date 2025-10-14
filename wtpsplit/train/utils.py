@@ -1,3 +1,5 @@
+# wtpsplit/train/utils.py
+
 import logging
 import os
 import torch
@@ -43,13 +45,27 @@ class Model(nn.Module):
         label_weights=None,
         **kwargs,
     ):
+        # ---- PATCH: avaler le kwarg ajouté par Transformers.Trainer
+        # (sinon SubwordXLMForTokenClassification.forward() plante)
+        kwargs.pop("num_items_in_batch", None)
+        # ------------------------------------------------------------
+
+        # Masque de réduction pour le calcul de perte (tokens "réels" uniquement)
         if position_ids is not None:
-            # XXX: 1 is pad token id
+            # XXX: 1 is pad token id pour XLM, 0 sinon
             if "xlm" in self.config.model_type:
                 reduced_attention_mask = (input_ids != 1).to(torch.long)
             else:
                 reduced_attention_mask = (input_ids != 0).to(torch.long)
+        else:
+            # fallback si jamais position_ids n'est pas fourni
+            if attention_mask is not None:
+                reduced_attention_mask = attention_mask.to(torch.long)
+            else:
+                # on devine via le pad id usuel (0)
+                reduced_attention_mask = (input_ids != 0).to(torch.long)
 
+        # Appel backbone : on transmet les kwargs restants (output_hidden_states, etc.)
         output = dict(
             self.backbone.forward(
                 input_ids=input_ids,
@@ -62,46 +78,40 @@ class Model(nn.Module):
         logits = output["logits"]
 
         if labels is not None:
+            # --- Objectif principal (prédiction de saut de ligne) ---
             loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+            loss = torch.tensor(0.0, dtype=logits.dtype, device=logits.device)
 
-            # main (newline prediction) objective
             if self.do_sentence_training:
-                # label smoothing
+                # label smoothing centré sur 0.5 avec marge +/- loss_margin
                 sentence_labels = (0.5 - self.loss_margin) + (labels == Constants.NEWLINE_INDEX + 1).to(
                     logits.dtype
                 ).view(-1) * self.loss_margin * 2
                 sentence_logits = logits[:, :, Constants.NEWLINE_INDEX].view(-1)
 
-                loss = (
-                    loss_fn(
-                        sentence_logits,
-                        sentence_labels,
-                    )
+                main_loss = (
+                    loss_fn(sentence_logits, sentence_labels)
                     * (label_weights.view(-1) if label_weights is not None and self.use_loss_weights else 1)
                     * reduced_attention_mask.view(-1)
-                ).sum() / reduced_attention_mask.sum()
+                )
 
-            # auxiliary (punctuation prediction) objective
+                # moyenne sur les tokens valides
+                loss = main_loss.sum() / (reduced_attention_mask.sum().clamp_min(1))
+
+            # --- Objectif auxiliaire (prédiction de ponctuation) ---
             if self.do_auxiliary_training:
-                loss_fn = nn.CrossEntropyLoss()
-
-                # exclude newline and no labels
+                ce = nn.CrossEntropyLoss()
+                # 0 = "no label", NEWLINE -> maské ; autres labels décalés par AUX_OFFSET
                 aux_labels = torch.where(
                     (labels == 0) | (labels == Constants.NEWLINE_INDEX + 1),
                     0,
                     labels - Constants.AUX_OFFSET,
                 )
-                # exclude reduced_attention_mask tokens from labels
-                aux_labels = torch.where(
-                    reduced_attention_mask == 1,
-                    aux_labels,
-                    loss_fn.ignore_index,
-                )
+                # mask des positions non valides
+                aux_labels = torch.where(reduced_attention_mask == 1, aux_labels, ce.ignore_index)
 
-                aux_loss = loss_fn(
-                    logits[:, :, Constants.AUX_OFFSET :].view(-1, self.config.num_labels - Constants.AUX_OFFSET),
-                    aux_labels.view(-1),
-                )
+                aux_logits = logits[:, :, Constants.AUX_OFFSET :].contiguous()
+                aux_loss = ce(aux_logits.view(-1, self.config.num_labels - Constants.AUX_OFFSET), aux_labels.view(-1))
 
                 loss = loss + self.aux_training_weight * aux_loss
 
