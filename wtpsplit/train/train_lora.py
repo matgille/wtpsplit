@@ -402,26 +402,37 @@ def main():
             for dataset_name in data[lang]["sentence"].keys():
                 print("RUNNING:", dataset_name, lang)
                 # do model stuff here; otherwise, head params would be overwritten every time
+                
+
+                tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+                num_added = tokenizer.add_special_tokens({"additional_special_tokens": [AddedToken("\n")]})
                 backbone = SubwordXLMForTokenClassification.from_pretrained(
                     args.model_name_or_path, config=copy.deepcopy(config), ignore_mismatched_sizes=True
                 )
                 backbone.config.base_model = args.base_model
 
                 # setup adapters
+                
+                if num_added and num_added > 0:
+                  try:
+                      backbone.resize_token_embeddings(len(tokenizer))
+                  except AttributeError:
+                      backbone.base_model.resize_token_embeddings(len(tokenizer))
                 model_type = backbone.config.model_type
                 # adapters need xlm-roberta as model type.
                 backbone.config.model_type = "xlm-roberta"  # needed for adapter setup
                 adapters.init(backbone)
                 # reset model type (used later)
                 backbone.config.model_type = model_type
-
-                tokenizer = AutoTokenizer.from_pretrained(args.base_model)
                 # needed since we create labels in collate_fn based on tokens
                 tokenizer.add_special_tokens({"additional_special_tokens": [AddedToken("\n")]})
                 custom_token_id = tokenizer.convert_tokens_to_ids("\n")
                 # used later to filter out special tokens
                 special_tokens_ids = set(tokenizer.all_special_ids)
                 special_tokens_ids.discard(custom_token_id)
+                vocab_len = len(tokenizer)
+                emb_len = backbone.get_input_embeddings().num_embeddings
+                print("len(tokenizer)=", vocab_len, " | emb.num_embeddings=", emb_len)
 
                 if "short" in dataset_name:
                     one_sample_per_line = True
