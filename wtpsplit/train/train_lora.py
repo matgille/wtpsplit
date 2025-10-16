@@ -1,19 +1,45 @@
+# -*- coding: utf-8 -*-
+"""
+Train LoRA adapters for SaT (wtpsplit) — single GPU, A100-friendly.
+
+Changements clés vs script d'origine :
+- **Pré-calcul des labels** (0/1 = token == '\n') dans le Dataset -> on supprime la
+  logique coûteuse du collate d'origine.
+- **FastCollator** ultra-lean (pad + attention_mask + to(device)).
+- BF16 + AdamW torch fused + SDPA activés.
+- torch.compile désactivé par défaut (TORCH_COMPILE=1 pour l'activer).
+- Parse JSON tolérant aux clés inconnues (allow_extra_keys) pour éviter les ValueError.
+"""
+
+# ------- ENV avant tout import HF/Datasets -------
+import os
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+os.environ.setdefault("HF_DATASETS_DISABLE_TF_IMPORT", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("WANDB_MODE", "offline")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCH_COMPILE", "0")   # mets TORCH_COMPILE=1 pour activer torch.compile
+# -------------------------------------------------
+
 import copy
+import json
 import logging
 import math
-import os
 import random
 import sys
 from collections import Counter
 from dataclasses import dataclass
-from functools import partial
 from glob import glob
-from typing import List, Optional, Union
+from typing import List, Optional
+
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
 
 import adapters
 import datasets
-import numpy as np
-import torch
 from adapters import AdapterArguments
 from adapters.models import MODEL_MIXIN_MAPPING
 from adapters.models.bert.mixin_bert import BertModelAdaptersMixin
@@ -25,25 +51,73 @@ import wandb
 from wtpsplit.models import SubwordXLMConfig, SubwordXLMForTokenClassification
 from wtpsplit.train.adaptertrainer import AdapterTrainer
 from wtpsplit.train.evaluate import evaluate_sentence
-from wtpsplit.train.train import collate_fn, setup_logging
 from wtpsplit.train.trainer import Trainer
 from wtpsplit.train.utils import Model
-from wtpsplit.utils import Constants, LabelArgs, get_label_dict, get_subword_label_dict
+from wtpsplit.utils import Constants, LabelArgs
 
 logger = logging.getLogger(__name__)
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# CUDA perf
+torch.backends.cuda.matmul.allow_tf32 = True
+cudnn.benchmark = True
 
+# Adapter shim pour le backbone XLM-R custom de SaT
 MODEL_MIXIN_MAPPING["SubwordXLMRobertaModel"] = BertModelAdaptersMixin
 
 
+# ------------------------- Collate rapide -------------------------
+class FastCollator:
+    """
+    Collate minimaliste : pad input_ids + labels, construit attention_mask.
+    Renvoie des tenseurs CPU. Le Trainer les déplace vers le device.
+    """
+    def __init__(self, pad_id: int = 0, debug: bool = False, move_to_device: bool = False, device: Optional[torch.device] = None):
+        self.pad_id = int(pad_id)
+        self.debug = debug
+        self.move_to_device = bool(move_to_device)
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def __call__(self, features):
+        if self.debug:
+            print(f"[FastCollator] got {len(features)} samples", flush=True)
+
+        input_ids = [torch.as_tensor(f["input_ids"], dtype=torch.long) for f in features]
+        labels    = [torch.as_tensor(f["labels"],    dtype=torch.long) for f in features]
+
+        max_len = max(x.size(0) for x in input_ids)
+
+        def pad(stack, pad_val):
+            out = torch.full((len(stack), max_len), pad_val, dtype=stack[0].dtype)  # CPU
+            for i, t in enumerate(stack):
+                n = t.size(0)
+                out[i, :n] = t
+            return out
+
+        input_ids = pad(input_ids, self.pad_id)          # CPU
+        labels    = pad(labels, 0)                        # CPU
+        attention = (input_ids != self.pad_id).long()     # CPU
+
+        batch = {
+            "input_ids":      input_ids,
+            "attention_mask": attention,
+            "labels":         labels,
+        }
+
+        # En temps normal on NE déplace PAS ici (laisser le Trainer gérer).
+        if self.move_to_device:
+            for k in batch:
+                batch[k] = batch[k].to(self.device, non_blocking=True)
+        return batch
+
+
+# ----------------------------- Args -----------------------------
 @dataclass
 class Args:
     model_name_or_path: str
     base_model: str = "xlm-roberta-base"
     shuffle: bool = True
     text_path: str = "data/all_data.pth"
-    include_languages: List[str] = None
+    include_languages: Optional[List[str]] = None
     preprocessing_num_workers: int = 1
     block_size: int = 512
     overflow_size: int = 16
@@ -62,8 +136,8 @@ class Args:
     text_column: str = "text"
     num_hidden_layers: int = 0
 
-    # NEW PARAMS
-    use_subwords: bool = False
+    # NEW
+    use_subwords: bool = True
     freeze_classifier: bool = False
     clf_from_scratch: bool = False
     unfreeze_ln: bool = False
@@ -71,38 +145,173 @@ class Args:
     meta_clf: bool = False
     wandb_project: str = "sentence"
     eval_every: int = 5
-    # corruption
     skip_eval_loss: bool = False
     subsample: Optional[float] = None
 
 
+# ----------------------------- Main -----------------------------
 def main():
     parser = HfArgumentParser([Args, TrainingArguments, LabelArgs, AdapterArguments])
-    if sys.argv[1].endswith(".json"):
-        (args, training_args, label_args, adapter_args) = parser.parse_json_file(sys.argv[1])
-        wandb_name = training_args.output_dir
+
+    # Lecture CLI / JSON (tolérante aux clés en trop)
+    if len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
+        try:
+            (args, training_args, label_args, adapter_args) = parser.parse_json_file(sys.argv[1], allow_extra_keys=True)
+            wandb_name = training_args.output_dir
+        except TypeError:
+            with open(sys.argv[1], "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            (args, training_args, label_args, adapter_args) = parser.parse_dict(raw, allow_extra_keys=True)
+            wandb_name = getattr(training_args, "output_dir", None)
     else:
         (args, training_args, label_args, adapter_args) = parser.parse_args_into_dataclasses()
         wandb_name = None
 
+    # Single-GPU safe defaults
+    training_args.local_rank = -1
+    training_args.deepspeed = None
+    training_args.ddp_backend = None
+
+    # DataLoader (collate léger => on peut remettre pin_memory)
+    training_args.dataloader_num_workers = 0
+    training_args.dataloader_persistent_workers = False
+    training_args.dataloader_pin_memory = True
+    training_args.remove_unused_columns = False
+    try:
+        training_args.dataloader_drop_last = True
+    except Exception:
+        pass
+
+    # A100 perf
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        training_args.fp16 = False
+        training_args.bf16 = True
+        training_args.optim = "adamw_torch_fused"
+        if getattr(training_args, "evaluation_strategy", None) in (None, "no"):
+            try:
+                training_args.evaluation_strategy = "epoch"
+            except Exception:
+                pass
+
+    # Logging & seed
+    from wtpsplit.train.train import setup_logging  # import local pour respecter l'env
     setup_logging(training_args)
     set_seed(training_args.seed)
 
-    num_labels = Constants.AUX_OFFSET + (
-        (1 + len(Constants.PUNCTUATION_CHARS))
-        if (label_args.use_auxiliary or args.do_auxiliary_training or args.meta_clf)
-        else 0
+    # Log device
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.warning(
+        f"Device: {dev.type} | n_gpu: {torch.cuda.device_count()} | distributed: {training_args.local_rank != -1}"
     )
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        logger.warning(f"GPU: {props.name} | VRAM (GB): {props.total_memory/1024**3:.1f}")
 
+    # --------- Config / labels ---------
+    # IMPORTANT : on reste sur la tête **binaire** du checkpoint (1 logit) sauf si l'utilisateur
+    # demande explicitement l'entraînement auxiliaire.
     if args.num_hidden_layers:
-        config = SubwordXLMConfig.from_pretrained(
-            args.model_name_or_path,
-            num_labels=num_labels,
-            num_hidden_layers=args.num_hidden_layers,
-        )
+        config = SubwordXLMConfig.from_pretrained(args.model_name_or_path, num_labels=1, num_hidden_layers=args.num_hidden_layers)
     else:
-        config = SubwordXLMConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
+        config = SubwordXLMConfig.from_pretrained(args.model_name_or_path)  # conserve num_labels du checkpoint (1)
 
+    if args.do_auxiliary_training or args.meta_clf:
+        num_labels = Constants.AUX_OFFSET + (1 + len(Constants.PUNCTUATION_CHARS))
+        config.num_labels = num_labels  # bascule vers tête multi-classe si demandé
+
+    # ---------- Tokenizer & special token ----------
+    logger.warning("[STEP] tokenizer init")
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    num_added = tokenizer.add_special_tokens({"additional_special_tokens": [AddedToken("\n")]})
+    newline_id = tokenizer.convert_tokens_to_ids("\n")
+    pad_id = tokenizer.pad_token_id or 0
+    special_tokens_ids = set(tokenizer.all_special_ids)
+    if newline_id in special_tokens_ids:
+        special_tokens_ids.remove(newline_id)
+
+    # ---------- Backbone + Adapters ----------
+    logger.warning("[STEP] backbone init")
+    backbone = SubwordXLMForTokenClassification.from_pretrained(
+        args.model_name_or_path, config=copy.deepcopy(config), ignore_mismatched_sizes=True
+    )
+    backbone.config.base_model = args.base_model
+
+    if num_added and num_added > 0:
+        try:
+            backbone.resize_token_embeddings(len(tokenizer))
+        except AttributeError:
+            backbone.base_model.resize_token_embeddings(len(tokenizer))
+
+    logger.warning("[STEP] adapters.init + add/train_adapter(text)")
+    orig_model_type = backbone.config.model_type
+    backbone.config.model_type = "xlm-roberta"
+    adapters.init(backbone)
+    backbone.config.model_type = orig_model_type
+    backbone.add_adapter("text", config=adapter_args.adapter_config, set_active=True, overwrite_ok=True)
+    backbone.train_adapter("text")
+
+    # SDPA (flash attention) si dispo
+    try:
+        backbone.config._attn_implementation = "sdpa"
+    except Exception:
+        pass
+
+    # torch.compile optionnel (désactivé par défaut)
+    use_compile = os.getenv("TORCH_COMPILE", "0") == "1"
+    if use_compile and hasattr(torch, "compile"):
+        logger.warning("[compile] enabled -> torch.compile(backbone)")
+        try:
+            backbone = torch.compile(backbone, fullgraph=False)
+        except Exception as e:
+            logger.warning(f"[compile] disabled (fallback): {e}")
+    else:
+        logger.warning("[compile] disabled")
+
+    # Wrapper Model
+    model = Model(
+        backbone,
+        loss_margin=args.loss_margin,
+        use_loss_weights=args.use_loss_weights,
+        do_sentence_training=args.do_sentence_training,
+        do_auxiliary_training=args.do_auxiliary_training,
+        aux_training_weight=args.aux_training_weight,
+    ).to(dev)
+
+    logger.warning(model.backbone.adapter_summary())
+    if args.freeze_classifier:
+        for n, p in model.backbone.named_parameters():
+            if "classifier" in n:
+                p.requires_grad = False
+    if args.clf_from_scratch:
+        model.backbone.classifier = torch.nn.Linear(model.backbone.config.hidden_size, config.num_labels).to(dev)
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        logger.warning(
+            f"[GPU] après to(dev) | allocated={torch.cuda.memory_allocated()/2**30:.2f}GB "
+            f"reserved={torch.cuda.memory_reserved()/2**30:.2f}GB"
+        )
+
+    # ---------- Data ----------
+    with training_args.main_process_first():
+        data = torch.load(args.text_path)
+        data = dict(sorted(data.items()))
+
+    if not args.include_languages:
+        args.include_languages = list(data.keys())
+
+    # W&B (optionnel)
+    if "wandb" in (training_args.report_to or []) and getattr(training_args, "process_index", 0) == 0:
+        wandb.init(name=wandb_name, project=args.wandb_project, group=wandb_name)
+        wandb.config.update(args)
+        wandb.config.update(training_args)
+        wandb.config.update({"newline_id": newline_id, "pad_id": pad_id})
+        wandb.config.update(adapter_args)
+        for file in glob(os.path.join(os.path.dirname(__file__), "*.py")):
+            wandb.save(os.path.abspath(file), policy="now")
+
+    # ---------- helpers dataset ----------
     def prepare_dataset(
         data,
         num_workers=1,
@@ -110,256 +319,163 @@ def main():
         dataset_name="ud",
         shuffle=False,
         split="train",
-        subsample: Union[None, int, float] = None,
+        subsample: Optional[float] = None,
         one_sample_per_line: bool = False,
     ):
         with training_args.main_process_first():
-            # this only uses 1 dataset-language combination, but can be easily adapted if needed
             for lang in include_languages:
                 if split == "train":
                     dataset = data[lang]["sentence"][dataset_name]["meta"]["train_data"]
                 elif split == "valid":
                     dataset = data[lang]["sentence"][dataset_name]["data"]
+                else:
+                    raise ValueError(f"Unknown split: {split}")
                 if dataset is None:
                     return None
 
                 if one_sample_per_line or isinstance(dataset[0], list):
-                    processed_dataset = []
+                    processed = []
                     for chunk in dataset:
                         if "\n" in chunk:
-                            raise ValueError(
-                                "Newlines in text are not supported! Data needs to be processed as a list of sentences."
-                            )
-                        processed_chunk = {}
-                        processed_chunk["lang"] = lang
-                        processed_chunk["ends_with_punctuation"] = chunk[-1].endswith(
-                            tuple(Constants.PUNCTUATION_CHARS)
+                            raise ValueError("Newlines not supported at this stage.")
+                        processed.append(
+                            {
+                                "lang": lang,
+                                "ends_with_punctuation": chunk[-1].endswith(tuple(Constants.PUNCTUATION_CHARS)),
+                                args.text_column: "\n".join(chunk),
+                            }
                         )
-                        # join all chunks
-                        processed_chunk[args.text_column] = "\n".join(chunk)
-                        processed_dataset.append(processed_chunk)
-                    dataset = datasets.Dataset.from_list(processed_dataset)
-
+                    dataset = datasets.Dataset.from_list(processed)
                 else:
-                    for i, chunk in enumerate(dataset):
-                        if "\n" in chunk:
-                            raise ValueError(
-                                "Newlines in text are not supported! Data needs to be processed as a list of sentences."
-                            )
+                    for sent in dataset:
+                        if "\n" in sent:
+                            raise ValueError("Newlines not supported at this stage.")
                     dataset = datasets.Dataset.from_list(
                         [
                             {
-                                args.text_column: sample + "\n" if sample and sample[-1] != "\n" else sample,
+                                args.text_column: (sent + "\n") if sent and sent[-1] != "\n" else sent,
                                 "lang": lang,
-                                "ends_with_punctuation": sample.endswith(tuple(Constants.PUNCTUATION_CHARS)),
+                                "ends_with_punctuation": sent.endswith(tuple(Constants.PUNCTUATION_CHARS)),
                             }
-                            for sample in dataset
+                            for sent in dataset
                         ]
                     )
-            with training_args.main_process_first():
-                logger.warning(f"Loaded {len(dataset)} examples for {lang} {dataset_name} {split} dataset.")
+            logger.warning(f"Loaded {len(dataset)} examples for {lang} {dataset_name} {split} dataset.")
 
         if shuffle:
             dataset = dataset.shuffle(seed=training_args.seed)
-        if subsample:
-            old_length = len(dataset)
-            if isinstance(subsample, int):
-                # ensure that we don't try to select more than the dataset length
-                subsample = min(subsample, len(dataset))
-                dataset = dataset.select(range(subsample))
-            elif isinstance(subsample, float):
-                dataset = dataset.select(range(int(subsample * len(dataset))))
-            logger.warning(f"Subsampled {len(dataset)} examples from {old_length}.")
 
-        # ignore
+        if subsample is not None:
+            old_len = len(dataset)
+            if subsample >= 1.0:
+              n = min(int(subsample), len(dataset))   # interprète comme nombre d’exemples
+            elif 0.0 < subsample < 1.0:
+              n = max(1, int(subsample * len(dataset)))  # interprète comme ratio
+            else:
+              n = len(dataset)
+            dataset = dataset.select(range(n))
+            logger.warning(f"Subsampled {len(dataset)} from {old_len}.")
         if args.ignore_non_hyphen:
             with training_args.main_process_first():
                 dataset = dataset.filter(
-                    lambda sample: any(c in sample[args.text_column] for c in label_args.hyphen_chars),
+                    lambda s: any(c in s[args.text_column] for c in label_args.hyphen_chars),
                     num_proc=args.preprocessing_num_workers,
                 )
-                with training_args.main_process_first():
-                    logger.info(f"Filtered to {len(dataset)} examples.")
+                logger.info(f"Filtered to {len(dataset)} examples (ignore_non_hyphen).")
 
-        # "punctuation-specific sampling" in the WtP paper
         if args.non_punctuation_sample_ratio is not None:
-            languages_without_punctuation = {
-                lang_code
-                for lang_code in Constants.LANGINFO.index
-                if Constants.LANGINFO.loc[lang_code, "no_punctuation"]
+            languages_without_punct = {
+                lc for lc in Constants.LANGINFO.index if Constants.LANGINFO.loc[lc, "no_punctuation"]
             }
 
-            def drop_some_non_punctuation_samples(examples):
-                include_indices = set(
-                    np.where([lang_code not in languages_without_punctuation for lang_code in examples["lang"]])[0]
-                )
-                punctuation_indices = {
-                    i for i in np.where(examples["ends_with_punctuation"])[0] if i in include_indices
-                }
-
+            def drop_some_non_punct(ex):
+                include_idx = set(np.where([lc not in languages_without_punct for lc in ex["lang"]])[0])
+                punct_idx = {i for i in np.where(ex["ends_with_punctuation"])[0] if i in include_idx}
                 target_n_non_punct = int(
-                    (len(punctuation_indices) * args.non_punctuation_sample_ratio)
-                    / (1 - args.non_punctuation_sample_ratio)
+                    (len(punct_idx) * args.non_punctuation_sample_ratio) / (1 - args.non_punctuation_sample_ratio)
                 )
-                n_drop = (len(include_indices) - len(punctuation_indices)) - target_n_non_punct
-
-                out = [True for _ in range(len(examples["ends_with_punctuation"]))]
-
-                if n_drop <= 0:
-                    return out
-                drop_indices = np.random.choice(
-                    list(include_indices - punctuation_indices),
-                    n_drop,
-                    replace=False,
-                )
-
-                for i in drop_indices:
-                    out[i] = False
-
-                return out
+                n_drop = (len(include_idx) - len(punct_idx)) - target_n_non_punct
+                keep = [True] * len(ex["ends_with_punctuation"])
+                if n_drop > 0:
+                    drop = np.random.choice(list(include_idx - punct_idx), n_drop, replace=False)
+                    for i in drop:
+                        keep[i] = False
+                return keep
 
             with training_args.main_process_first():
-                dataset = dataset.filter(
-                    drop_some_non_punctuation_samples,
-                    batched=True,
-                    batch_size=1_000_000,
-                    num_proc=num_workers,
-                )
+                dataset = dataset.filter(drop_some_non_punct, batched=True, batch_size=1_000_000, num_proc=num_workers)
 
+        # --- tokenize ---
         def tokenize_texts(examples):
-            # do not return CLS and SEP token here
-            # there should only be 1 of these per block later, not multiple
-            # we still can't use return_special_tokens=False since we need the \n token later for the labels
-            tokenized = tokenizer(examples[args.text_column], verbose=False)
-            return {"input_ids": [example[1:-1] for example in tokenized["input_ids"]]}
+            toks = tokenizer(examples[args.text_column], verbose=False)
+            # on enlève BOS/EOS pour éviter des '\n' multiples aux bords
+            return {"input_ids": [ids[1:-1] for ids in toks["input_ids"]]}
 
-        # similar to group_texts in huggingface's run_clm.py / run_mlm.py: https://github.com/huggingface/transformers/blob/main/examples/pytorch/language-modeling/run_mlm.py
+        # --- group into blocks ---
         def group_texts(examples):
-            all_input_blocks = []
-            all_input_block_lengths = []
-            all_langs = []
+            all_blocks, all_block_lengths, all_langs = [], [], []
 
             def maybe_pad(text):
                 if args.pack_samples:
-                    padding = model.backbone.config.downsampling_rate - (len(text) % model.backbone.downsampling_rate)
-                    if padding == model.backbone.downsampling_rate:
-                        padding = 0
-
-                    text += chr(0) * padding
-
+                    pad = config.downsampling_rate - (len(text) % config.downsampling_rate)
+                    if pad == config.downsampling_rate:
+                        pad = 0
+                    text += chr(0) * pad
                 return text
 
             for current_lang in set(examples["lang"]):
                 if not args.use_subwords:
                     lang_texts = [
-                        maybe_pad(text)
-                        for text, lang in zip(examples["input_ids"], examples["lang"])
-                        if lang == current_lang
+                        maybe_pad(t) for t, lc in zip(examples["input_ids"], examples["lang"]) if lc == current_lang
                     ]
                 else:
-                    # only retain current_lang examples (all columns)
-                    lang_subwords = [
-                        subwords
-                        for subwords, lang in zip(examples["input_ids"], examples["lang"])
-                        if lang == current_lang
-                    ]
-                    # filter out some special tokens
-                    # from html tags, mostly in Latin, Thai & Korean
-                    lang_subwords = [
-                        [subword for subword in subwords if subword not in special_tokens_ids]
-                        for subwords in lang_subwords
-                    ]
-                # pack_samples used for the compound part, so irrelevant
+                    lang_sub = [sw for sw, lc in zip(examples["input_ids"], examples["lang"]) if lc == current_lang]
+                    # retire spéciaux sauf '\n' dédié
+                    lang_sub = [[tok for tok in sw if tok not in special_tokens_ids] for sw in lang_sub]
+
                 if args.pack_samples:
-                    if args.use_subwords:
-                        raise NotImplementedError
-                    blocks = []
-                    block_ids = []
-
-                    current_block = ["", []]
-
-                    for i, text in enumerate(lang_texts):
-                        if len(text) > args.block_size:
-                            continue
-
-                        current_block[0] += text
-                        current_block[1] += [i] * len(text)
-
-                        if i + 1 < len(lang_texts) and len(current_block[0]) + len(lang_texts[i + 1]) > args.block_size:
-                            padding = args.block_size - len(current_block[0])
-
-                            current_block[0] += chr(0) * padding
-                            current_block[1] += [i] * padding
-                            blocks.append(current_block[0])
-                            block_ids.append(current_block[1])
-
-                            current_block = ["", []]
-
-                    if len(current_block[0]) > 0:
-                        padding = args.block_size - len(current_block[0])
-
-                        current_block[0] += chr(0) * padding
-                        current_block[1] += [i] * padding
-                        blocks.append(current_block[0])
-                        block_ids.append(current_block[1])
+                    raise NotImplementedError("pack_samples n'est pas supporté pour subwords ici")
                 else:
                     if not args.use_subwords:
-                        concatenated_texts = "".join(lang_texts)
-                        concatenated_ids = [i for i, text in enumerate(lang_texts) for _ in text]
+                        concatenated = "".join(lang_texts)
+                        concat_ids = [i for i, t in enumerate(lang_texts) for _ in t]
                     else:
-                        # concatenate token lists
-                        concatenated_texts = [item for sublist in lang_subwords for item in sublist]
-                        concatenated_ids = [i for i, subwords in enumerate(lang_subwords) for _ in subwords]
+                        concatenated = [x for sub in lang_sub for x in sub]
+                        concat_ids = [i for i, sw in enumerate(lang_sub) for _ in sw]
 
-                    total_length = len(concatenated_texts)
+                    total_len = len(concatenated)
+                    best_len = math.ceil(total_len / args.block_size) * args.block_size + args.overflow_size
+                    while best_len > total_len:
+                        best_len -= args.block_size
+                    if best_len < args.block_size:
+                        best_len = args.block_size + 1
+                    if best_len < 0:
+                        return {"input_ids": [], "block_lengths": [], "lang": []}
 
-                    best_length = math.ceil(total_length / args.block_size) * args.block_size + args.overflow_size
-                    while best_length > total_length:
-                        best_length -= args.block_size
-                    if best_length < args.block_size:
-                        best_length = args.block_size + 1
-
-                    if best_length < 0:
-                        continue
-
-                    concatenated_texts = concatenated_texts[:best_length]
-                    concatenated_ids = concatenated_ids[:best_length]
+                    concatenated = concatenated[:best_len]
+                    concat_ids = concat_ids[:best_len]
 
                     blocks = [
-                        concatenated_texts[i : i + args.block_size + args.overflow_size]
-                        for i in range(0, best_length - args.block_size, args.block_size)
+                        concatenated[i : i + args.block_size + args.overflow_size]
+                        for i in range(0, best_len - args.block_size, args.block_size)
                     ]
                     block_ids = [
-                        concatenated_ids[i : i + args.block_size + args.overflow_size]
-                        for i in range(0, best_length - args.block_size, args.block_size)
+                        concat_ids[i : i + args.block_size + args.overflow_size]
+                        for i in range(0, best_len - args.block_size, args.block_size)
                     ]
 
-                block_langs = [current_lang] * len(blocks)
+                all_blocks.extend(blocks)
+                all_block_lengths.extend([list(Counter(ids).values()) for ids in block_ids])
+                all_langs.extend([current_lang] * len(blocks))
 
-                all_input_blocks.extend(blocks)
-                all_input_block_lengths.extend([list(Counter(ids).values()) for ids in block_ids])
-                all_langs.extend(block_langs)
-
-            return {
-                "input_ids": all_input_blocks,
-                "block_lengths": all_input_block_lengths,
-                "lang": all_langs,
-            }
-
-        if args.pack_samples:
-            assert not one_sample_per_line
+            return {"input_ids": all_blocks, "block_lengths": all_block_lengths, "lang": all_langs}
 
         if args.use_subwords:
             with training_args.main_process_first():
                 dataset = dataset.map(
-                    tokenize_texts,
-                    batched=True,
-                    num_proc=num_workers,
-                    remove_columns=[args.text_column],
-                    desc="Tokenizing",
+                    tokenize_texts, batched=True, num_proc=num_workers, remove_columns=[args.text_column], desc="Tokenizing"
                 )
         else:
-            # this is no longer used and would cause an error otherwise
             with training_args.main_process_first():
                 dataset = dataset.rename_column(args.text_column, "input_ids")
 
@@ -369,230 +485,160 @@ def main():
                     group_texts,
                     batched=True,
                     num_proc=num_workers,
-                    # a bit hacky but oh well, only drop if sentence
                     remove_columns=["ends_with_punctuation"] if args.text_column == "text" else [],
                     desc="Grouping",
                 )
 
+        # ------- PRECOMPUTE LABELS : 0/1 (boundary = token '\n') -------
+        def add_labels(examples):
+            return {
+                "labels": [[1 if t == newline_id else 0 for t in ids] for ids in examples["input_ids"]]
+            }
+
+        with training_args.main_process_first():
+            dataset = dataset.map(add_labels, batched=True, num_proc=1, desc="Precomputing labels")
+
         return dataset
 
-    with training_args.main_process_first():
-        data = torch.load(
-            args.text_path,
-        )
-        # sort alphabetically by key for alphabetical filtering
-        data = dict(sorted(data.items()))
+    # ---------- Loop ----------
+    for lang in tqdm(list(data.keys()), desc="Language"):
+        if lang not in args.include_languages:
+            continue
 
-    if not args.include_languages:
-        args.include_languages = list(data.keys())  # use all
+        for dataset_name in data[lang]["sentence"].keys():
+            print("RUNNING:", dataset_name, lang)
 
-    # 1 wandb run for all language-dataset combinations
-    if "wandb" in training_args.report_to and training_args.process_index == 0:
-        wandb.init(name=wandb_name, project=args.wandb_project, group=wandb_name)
-        wandb.config.update(args)
-        wandb.config.update(training_args)
-        wandb.config.update(label_args)
-        wandb.config.update(adapter_args)
+            one_sample_per_line = True if "short" in dataset_name else args.one_sample_per_line
 
-        for file in glob(os.path.join(os.path.dirname(__file__), "*.py")):
-            wandb.save(os.path.abspath(file), policy="now")
-
-    for lang in tqdm(data.keys(), desc="Language"):
-        if lang in args.include_languages:
-            for dataset_name in data[lang]["sentence"].keys():
-                print("RUNNING:", dataset_name, lang)
-                # do model stuff here; otherwise, head params would be overwritten every time
-                
-
-                tokenizer = AutoTokenizer.from_pretrained(args.base_model)
-                num_added = tokenizer.add_special_tokens({"additional_special_tokens": [AddedToken("\n")]})
-                backbone = SubwordXLMForTokenClassification.from_pretrained(
-                    args.model_name_or_path, config=copy.deepcopy(config), ignore_mismatched_sizes=True
+            with training_args.main_process_first():
+                valid_dataset = prepare_dataset(
+                    data=data,
+                    num_workers=1,
+                    include_languages=[lang],
+                    dataset_name=dataset_name,
+                    shuffle=False,
+                    split="valid",
+                    one_sample_per_line=one_sample_per_line,
                 )
-                backbone.config.base_model = args.base_model
+                if valid_dataset is None:
+                    logger.warning(f"Skipping {lang} {dataset_name} (missing valid).")
+                    continue
+                logger.warning(f"Valid ds for {lang} {dataset_name} has {len(valid_dataset)} examples.")
 
-                # setup adapters
-                
-                if num_added and num_added > 0:
-                  try:
-                      backbone.resize_token_embeddings(len(tokenizer))
-                  except AttributeError:
-                      backbone.base_model.resize_token_embeddings(len(tokenizer))
-                model_type = backbone.config.model_type
-                # adapters need xlm-roberta as model type.
-                backbone.config.model_type = "xlm-roberta"  # needed for adapter setup
-                adapters.init(backbone)
-                # reset model type (used later)
-                backbone.config.model_type = model_type
-                # needed since we create labels in collate_fn based on tokens
-                tokenizer.add_special_tokens({"additional_special_tokens": [AddedToken("\n")]})
-                custom_token_id = tokenizer.convert_tokens_to_ids("\n")
-                # used later to filter out special tokens
-                special_tokens_ids = set(tokenizer.all_special_ids)
-                special_tokens_ids.discard(custom_token_id)
-                vocab_len = len(tokenizer)
-                emb_len = backbone.get_input_embeddings().num_embeddings
-                print("len(tokenizer)=", vocab_len, " | emb.num_embeddings=", emb_len)
-
-                if "short" in dataset_name:
-                    one_sample_per_line = True
-                else:
-                    one_sample_per_line = args.one_sample_per_line  # used for lyrics
-
-                model = Model(
-                    backbone,
-                    loss_margin=args.loss_margin,
-                    use_loss_weights=args.use_loss_weights,
-                    do_sentence_training=args.do_sentence_training,
-                    do_auxiliary_training=args.do_auxiliary_training,
-                    aux_training_weight=args.aux_training_weight,
+                train_dataset = prepare_dataset(
+                    data=data,
+                    num_workers=args.preprocessing_num_workers,
+                    include_languages=[lang],
+                    dataset_name=dataset_name,
+                    shuffle=args.shuffle,
+                    split="train",
+                    subsample=args.subsample,
+                    one_sample_per_line=one_sample_per_line,
                 )
+                if train_dataset is None:
+                    logger.warning(f"Skipping {lang} {dataset_name} (missing train).")
+                    continue
+                logger.warning(f"Train ds for {lang} {dataset_name} has {len(train_dataset)} examples.")
+
+            # Debug sample
+            idx = random.choice(range(len(train_dataset)))
+            sample = train_dataset[idx]
+            logger.warning(f"Sample {idx} of train: {sample}.")
+            try:
+                logger.warning(AutoTokenizer.from_pretrained(args.base_model).decode(sample["input_ids"]))
+            except Exception:
+                pass
+
+            # ----- metrics (texte concat) -----
+            def compute_metrics(trainer):
+                metrics = {}
+                eval_data = data[lang]["sentence"][dataset_name]["data"]
+                model_eval = trainer._wrap_model(trainer.model, training=False)
 
                 with training_args.main_process_first():
-                    valid_dataset = prepare_dataset(
-                        data=data,
-                        num_workers=1,
-                        include_languages=[lang],
-                        dataset_name=dataset_name,
-                        shuffle=False,
-                        split="valid",
-                        one_sample_per_line=one_sample_per_line,
+                    if one_sample_per_line or isinstance(eval_data[0], list):
+                        eval_data = [item for sublist in eval_data for item in sublist]
+                    score, info = evaluate_sentence(
+                        lang,
+                        eval_data,
+                        model_eval,
+                        stride=args.eval_stride,
+                        block_size=args.block_size,
+                        batch_size=training_args.per_device_eval_batch_size,
                     )
-                    logger.warning(f"Valid ds for {lang} {dataset_name} has {len(valid_dataset)} examples.")
+                    metrics[f"{dataset_name}/{lang}/pr_auc"] = score
+                    metrics[f"{dataset_name}/{lang}/f1"] = info["f1"]
+                    metrics[f"{dataset_name}/{lang}/f1_best"] = info["f1_best"]
+                    metrics[f"{dataset_name}/{lang}/threshold_best"] = info["threshold_best"]
+                return metrics
 
-                    train_dataset = prepare_dataset(
-                        data=data,
-                        num_workers=args.preprocessing_num_workers,
-                        include_languages=[lang],
-                        dataset_name=dataset_name,
-                        shuffle=args.shuffle,
-                        split="train",
-                        subsample=args.subsample,
-                        one_sample_per_line=one_sample_per_line,
+            # Eval à l'époque si possible
+            try:
+                if getattr(training_args, "evaluation_strategy", None) in (None, "no"):
+                    training_args.evaluation_strategy = "epoch"
+            except Exception:
+                pass
+
+            # --------- Data collator (rapide) ----------
+            data_collator = FastCollator(pad_id=pad_id, debug=(os.getenv("DEBUG_COLLATE", "0") == "1"))
+            # Trainer (AdapterTrainer quand train_adapter=True)
+            trainer_cls = AdapterTrainer if adapter_args.train_adapter else Trainer
+            trainer = trainer_cls(
+                model,
+                training_args,
+                train_dataset=train_dataset,
+                eval_dataset=valid_dataset,
+                compute_metrics=compute_metrics,
+                data_collator=data_collator,
+                logging_prefix=f"{dataset_name}/{lang}/",
+                skip_eval_loss=args.skip_eval_loss,
+            )
+
+            # Warm-up court (ramène les kernels à chaud)
+            if torch.cuda.is_available():
+                L = min(256, args.block_size)
+                with torch.cuda.amp.autocast(enabled=training_args.bf16):
+                    model.backbone.train()
+                    fake_input_ids = torch.randint(5, 100, (2, L), device=dev, dtype=torch.long)
+                    fake_attn = torch.ones_like(fake_input_ids)
+                    fake_labels = torch.zeros((2, L), device=dev, dtype=torch.long)
+                    out = model.backbone(
+                        input_ids=fake_input_ids, attention_mask=fake_attn, labels=fake_labels
                     )
-                    if train_dataset is None or valid_dataset is None:
-                        logger.warning(f"Skipping {lang} {dataset_name} due to missing data.")
-                        continue
-                    logger.warning(f"Train ds for {lang} {dataset_name} has {len(train_dataset)} examples.")
-
-                # print some samples from the dataset
-                count = 0
-                while count < 1:
-                    index = random.choice(range(len(train_dataset)))
-                    sample = train_dataset[index]
-
-                    logger.warning(f"Sample {index} of the training set: {sample}.")
-                    if tokenizer:
-                        logger.warning(tokenizer.decode(sample["input_ids"]))
-                    count += 1
-
-                def compute_metrics(trainer):
-                    metrics = {}
-                    eval_data = data[lang]["sentence"][dataset_name]["data"]
-
-                    model = trainer._wrap_model(trainer.model, training=False)
-
-                    with training_args.main_process_first():
-                        # feeding in single samples is too slow --> feed in as one long text
-                        if args.one_sample_per_line:
-                            eval_data = [item for sublist in eval_data for item in sublist]
-                        elif isinstance(eval_data[0], list):
-                            eval_data = [item for sublist in eval_data for item in sublist]
-                        score, info = evaluate_sentence(
-                            lang,
-                            eval_data,
-                            model,
-                            stride=args.eval_stride,
-                            block_size=args.block_size,
-                            batch_size=training_args.per_device_eval_batch_size,
-                        )
-                        metrics[f"{dataset_name}/{lang}/pr_auc"] = score
-                        metrics[f"{dataset_name}/{lang}/f1"] = info["f1"]
-                        metrics[f"{dataset_name}/{lang}/f1_best"] = info["f1_best"]
-                        metrics[f"{dataset_name}/{lang}/threshold_best"] = info["threshold_best"]
-
-                    return metrics
-
-                label_dict = (
-                    get_subword_label_dict(label_args, tokenizer) if args.use_subwords else get_label_dict(label_args)
+                    loss = getattr(out, "loss", None)
+                    if loss is not None:
+                        loss.backward()
+                torch.cuda.synchronize()
+                logger.warning("[WARMUP] 1 fwd+bwd synthétique OK")
+                logger.warning(
+                    f"[GPU] before train | alloc={torch.cuda.memory_allocated()/2**30:.2f}GB "
+                    f"res={torch.cuda.memory_reserved()/2**30:.2f}GB"
                 )
 
+            # --------- Train ----------
+            trainer.train(resume_from_checkpoint=getattr(training_args, "resume_from_checkpoint", None))
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                logger.warning(
+                    f"[GPU] after train  | alloc={torch.cuda.memory_allocated()/2**30:.2f}GB "
+                    f"res={torch.cuda.memory_reserved()/2**30:.2f}GB"
+                )
+
+            logger.warning(f"Finished training for {lang} {dataset_name}.")
+
+            # --------- Save ----------
+            if getattr(training_args, "local_rank", -1) in (-1, 0):
+                out_dir = os.path.join(training_args.output_dir, dataset_name, lang)
+                os.makedirs(out_dir, exist_ok=True)
+                save_model = copy.deepcopy(model.backbone).to("cpu")
                 if adapter_args.train_adapter:
-                    # init new adapter
-                    model.backbone.add_adapter(
-                        "text", config=adapter_args.adapter_config, set_active=True, overwrite_ok=True
-                    )
-                    model.backbone.train_adapter("text")
-                    kwargs = {"logging_prefix": f"{dataset_name}/{lang}/", "skip_eval_loss": args.skip_eval_loss}
+                    save_model.save_adapter(adapter_name="text", save_directory=out_dir, with_head=True)
                 else:
-                    # needed in the trainer otherwise (WtP-related only)
-                    training_args.adapter_warmup_steps = args.adapter_warmup_steps
-                    training_args.adapter_lr_multiplier = args.adapter_lr_multiplier
-                    kwargs = {}
-
-                with training_args.main_process_first():
-                    logger.warning(model.backbone.adapter_summary())
-
-                if args.freeze_classifier:
-                    for n, p in model.backbone.named_parameters():
-                        if "classifier" in n:
-                            p.requires_grad = False
-                # not done: keeping clf head is much better
-                if args.clf_from_scratch:
-                    model.backbone.classifier = torch.nn.Linear(model.backbone.config.hidden_size, num_labels)
-
-                # eval only 5x during the entire training
-                training_args.evaluation_strategy = "steps"
-                training_args.eval_steps = max(
-                    (
-                        len(train_dataset)
-                        // training_args.per_device_train_batch_size
-                        // training_args.gradient_accumulation_steps
-                        // args.eval_every
-                        * training_args.num_train_epochs
-                    ),
-                    args.eval_every,
-                )
-
-                trainer_cls = AdapterTrainer if adapter_args.train_adapter else Trainer
-
-                trainer = trainer_cls(
-                    model,
-                    training_args,
-                    train_dataset=train_dataset,
-                    eval_dataset=valid_dataset,
-                    compute_metrics=compute_metrics,
-                    data_collator=partial(
-                        collate_fn,
-                        args=args,
-                        label_args=label_args,
-                        label_dict=label_dict,
-                        tokenizer=tokenizer,
-                        add_lang_ids=False,
-                    ),
-                    **kwargs,
-                )
-                trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-                logger.warning(f"Finished training for {lang} {dataset_name}.")
-
-                # only save trained module
-                if training_args.local_rank == 0:
-                    if not os.path.exists(os.path.join(training_args.output_dir, dataset_name, lang)):
-                        os.makedirs(os.path.join(training_args.output_dir, dataset_name, lang))
-                    save_model = copy.deepcopy(model.backbone)
-                    save_model = save_model.to("cpu")
-                    if adapter_args.train_adapter:
-                        save_model.to("cpu").save_adapter(
-                            adapter_name="text",
-                            save_directory=os.path.join(training_args.output_dir, dataset_name, lang),
-                            with_head=True,
-                        )
-                    else:
-                        save_model.to("cpu").save_pretrained(os.path.join(training_args.output_dir, dataset_name, lang))
+                    save_model.save_pretrained(out_dir)
 
 
 def _mp_fn(index):
-    # For xla_spawn (TPUs)
     main()
 
 
