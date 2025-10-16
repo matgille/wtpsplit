@@ -1,23 +1,23 @@
 {
   "model_name_or_path": "segment-any-text/sat-12l",
-  "output_dir": "sat-12l_lora_EXPERIMENT",
+  "output_dir": "sat-12l_lora_FIX_r16_clean",
   "text_path": "/content/wtpsplit/wtpsplit/utils/mon-corpus.pth",
 
   "block_size": 256,
   "overflow_size": 32,
-  "eval_stride": 64,
+  "eval_stride": 128,
 
   "do_train": true,
   "do_eval": true,
   "per_device_train_batch_size": 64,
   "per_device_eval_batch_size": 64,
-  "gradient_accumulation_steps": 2,               
+  "gradient_accumulation_steps": 8,
 
-  "learning_rate": 5e-5,
+  "learning_rate": 8e-5,
   "lr_scheduler_type": "cosine",
-  "warmup_ratio": 0.12,
-  "weight_decay": 0.05,
-  "max_grad_norm": 0.5,
+  "warmup_ratio": 0.10,
+  "weight_decay": 0.01,
+  "max_grad_norm": 0.8,
 
   "bf16": true,
   "optim": "adamw_torch_fused",
@@ -30,17 +30,18 @@
   "do_sentence_training": true,
   "use_subwords": true,
   "use_loss_weights": true,
-  "non_punctuation_sample_ratio": 0.7,        
+  "non_punctuation_sample_ratio": null,      
 
-  "adapter_config": "lora[r=8,alpha=16,dropout=0.2,intermediate_lora=True]",
+  "adapter_config": "lora[r=16,alpha=32,dropout=0.1,intermediate_lora=True]",
   "train_adapter": true,
 
   "early_stop_monitor": "pr_auc",
-  "early_stop_patience": 15,
+  "early_stop_patience": 12,
   "early_stop_min_delta": 5e-5,
   "custom_punctuation_file": "punctuation_xlmr_unk.txt",
 
-  "dataloader_drop_last": true,
+  "dataloader_drop_last": false,
   "dataloader_num_workers": 0,
   "preprocessing_num_workers": 1
+
 }
